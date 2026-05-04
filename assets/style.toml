@@ -1,16 +1,16 @@
 [terrain]
-water_light = { r = 78, g = 152, b = 226, a = 255 }
-water_dark = { r = 22, g = 82, b = 166, a = 255 }
-land_low = { r = 82, g = 118, b = 68, a = 255 }
-land_mid = { r = 164, g = 158, b = 96, a = 255 }
-land_high = { r = 218, g = 214, b = 200, a = 255 }
-snow = { r = 244, g = 244, b = 248, a = 255 }
+water_light = { r = 162, g = 218, b = 242, a = 255 }
+water_dark = { r = 110, g = 178, b = 220, a = 255 }
+land_low = { r = 208, g = 227, b = 180, a = 255 }
+land_mid = { r = 247, g = 241, b = 223, a = 255 }
+land_high = { r = 220, g = 205, b = 175, a = 255 }
+snow = { r = 248, g = 245, b = 235, a = 255 }
 
 [forest]
-color = { r = 22, g = 72, b = 28, a = 255 }
-blur_radius = 8
-blur_passes = 2
-opacity = 0.62
+color = { r = 189, g = 230, b = 171, a = 255 }
+blur_radius = 6
+blur_passes = 3
+opacity = 140.0
 
 [roads]
 underground_casing = { r = 20, g = 20, b = 28, a = 255 }
@@ -19,32 +19,32 @@ elevated_casing = { r = 255, g = 255, b = 255, a = 255 }
 elevated_body = { r = 255, g = 255, b = 255, a = 255 }
 
 [roads.highway]
-casing = { r = 20, g = 32, b = 54, a = 255 }
-body = { r = 79, g = 122, b = 188, a = 255 }
-casing_extra = 4.0
-body_scale = 1.0
+casing = { r = 239, g = 209, b = 81, a = 255 }
+body = { r = 255, g = 225, b = 95, a = 255 }
+casing_extra = 1.8
+body_scale = 0.82
 opacity = 1.0
 
 [roads.large_road]
-casing = { r = 40, g = 46, b = 58, a = 255 }
-body = { r = 90, g = 108, b = 134, a = 255 }
-casing_extra = 3.5
-body_scale = 0.92
-opacity = 1.0
+casing = { r = 210, g = 210, b = 210, a = 255 }
+body = { r = 255, g = 255, b = 255, a = 255 }
+casing_extra = 1.4
+body_scale = 0.78
+opacity = 0.95
 
 [roads.medium_road]
-casing = { r = 42, g = 44, b = 52, a = 255 }
-body = { r = 104, g = 110, b = 121, a = 255 }
-casing_extra = 3.0
-body_scale = 0.84
-opacity = 1.0
+casing = { r = 200, g = 200, b = 200, a = 255 }
+body = { r = 255, g = 255, b = 255, a = 255 }
+casing_extra = 1.2
+body_scale = 0.72
+opacity = 0.9
 
 [roads.small_road]
-casing = { r = 42, g = 42, b = 46, a = 255 }
-body = { r = 120, g = 123, b = 132, a = 255 }
-casing_extra = 2.5
-body_scale = 0.72
-opacity = 1.0
+casing = { r = 60, g = 60, b = 60, a = 255 }
+body = { r = 90, g = 90, b = 90, a = 255 }
+casing_extra = 1.0
+body_scale = 0.65
+opacity = 0.85
 
 [roads.pedestrian_street]
 casing = { r = 78, g = 68, b = 48, a = 255 }
@@ -358,3 +358,47 @@ other_opacity = 0.85
 metro_width = 6.0
 pedestrian_width = 4.0
 other_width = 4.0
+
+# Alternate palette block: Style 2 - Print Only (B&W)
+#
+# [terrain]
+# water_light = { r = 209, g = 209, b = 209, a = 255 }
+# water_dark = { r = 175, g = 175, b = 175, a = 255 }
+# land_low = { r = 255, g = 255, b = 255, a = 255 }
+# land_mid = { r = 245, g = 245, b = 245, a = 255 }
+# land_high = { r = 225, g = 225, b = 225, a = 255 }
+# snow = { r = 255, g = 255, b = 255, a = 255 }
+#
+# [forest]
+# color = { r = 200, g = 200, b = 200, a = 255 }
+# blur_radius = 6
+# blur_passes = 3
+# opacity = 140.0
+#
+# [roads.highway]
+# casing = { r = 40, g = 40, b = 40, a = 255 }
+# body = { r = 0, g = 0, b = 0, a = 255 }
+# casing_extra = 1.8
+# body_scale = 0.82
+# opacity = 1.0
+#
+# [roads.large_road]
+# casing = { r = 60, g = 60, b = 60, a = 255 }
+# body = { r = 0, g = 0, b = 0, a = 255 }
+# casing_extra = 1.4
+# body_scale = 0.78
+# opacity = 0.9
+#
+# [roads.medium_road]
+# casing = { r = 80, g = 80, b = 80, a = 255 }
+# body = { r = 0, g = 0, b = 0, a = 255 }
+# casing_extra = 1.2
+# body_scale = 0.72
+# opacity = 0.85
+#
+# [roads.small_road]
+# casing = { r = 80, g = 80, b = 80, a = 255 }
+# body = { r = 0, g = 0, b = 0, a = 255 }
+# casing_extra = 1.0
+# body_scale = 0.65
+# opacity = 0.8

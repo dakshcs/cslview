@@ -4,13 +4,13 @@ use std::fmt::Write;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
-use crate::export::{DistrictMode, DistrictSetting, ExportSettings, LayerSetting, RoadLayers, TransitLayers};
+use crate::export::{DistrictMode, DistrictSetting, ExportSettings, LayerSetting, MapMode, RoadLayers, TransitLayers};
 use crate::model::ElevationState;
 use crate::model::WorldPoint;
 use crate::scene::{RasterLayer, Scene};
 use crate::style::{
-    building_style, district_style, elevation_state, node_style, park_style, route_style,
-    segment_style, NodeShape,
+    background_color, building_style, contour_style, district_style, elevation_state, label_style,
+    node_style, park_style, route_style, segment_style, NodeShape,
 };
 use crate::viewport::{polygon_points, polyline_path, ViewportTransform};
 
@@ -24,38 +24,60 @@ pub fn scene_to_svg(scene: &Scene, settings: &ExportSettings) -> String {
         settings.zoom,
     );
 
+    let label_theme = label_style(settings.mode);
     let mut output = String::new();
-    let layers = &settings.layers;
     let _ = write!(
         output,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{}\" height=\"{}\" viewBox=\"{}\" shape-rendering=\"geometricPrecision\">\n<defs>\n  <style>\n    .text-ui {{ font-family: system-ui, sans-serif; }}\n    .label-shadow {{ paint-order: stroke fill; stroke: rgba(0, 0, 0, 0.58); stroke-width: 6; stroke-linejoin: round; }}\n    .segment {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}\n    .area {{ stroke-linejoin: round; stroke-linecap: round; }}\n  </style>\n</defs>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{}\" height=\"{}\" viewBox=\"{}\" shape-rendering=\"geometricPrecision\">\n<defs>\n  <style>\n    .text-ui {{ font-family: system-ui, sans-serif; }}\n    .label-shadow {{ paint-order: stroke fill; stroke: {}; stroke-width: 6; stroke-linejoin: round; }}\n    .segment {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}\n    .area {{ stroke-linejoin: round; stroke-linecap: round; }}\n  </style>\n</defs>\n",
         settings.width,
         settings.height,
         transform.screen_rect(),
+        label_theme.shadow.to_css(),
     );
 
-    let _ = writeln!(output, "<rect width=\"100%\" height=\"100%\" fill=\"#0d1015\"/>");
+    let _ = writeln!(
+        output,
+        "<rect width=\"100%\" height=\"100%\" fill=\"{}\"/>",
+        background_color(settings.mode).to_css(),
+    );
 
-    if let Some(terrain) = scene.terrain.as_ref() {
-        output.push_str(&raster_layer_svg(terrain, &transform, layers.terrain.opacity));
-    }
-    if let Some(forests) = scene.forests.as_ref() {
-        output.push_str(&raster_layer_svg(forests, &transform, layers.forests.opacity));
+    if settings.mode == MapMode::Colour {
+        if let Some(terrain) = scene.terrain.as_ref() {
+            output.push_str(&raster_layer_svg(terrain, &transform, settings.layers.terrain.opacity));
+        }
+        if let Some(forests) = scene.forests.as_ref() {
+            output.push_str(&raster_layer_svg(forests, &transform, settings.layers.forests.opacity));
+        }
     }
 
-    output.push_str(&render_districts(scene, &transform, &settings.districts, layers.districts.opacity));
-    output.push_str(&render_parks(scene, &transform, layers.parks.opacity));
-    output.push_str(&render_segments(scene, &transform, &settings.roads, layers.roads.opacity));
-    output.push_str(&render_routes(scene, &transform, &settings.transit, layers.transit.opacity));
-    output.push_str(&render_buildings(scene, &transform, layers.buildings.opacity));
-    output.push_str(&render_nodes(scene, &transform, layers.nodes.opacity));
-    output.push_str(&render_labels(scene, &transform, layers.labels.opacity));
+    let show_contours = settings.mode == MapMode::Contour
+        || (settings.mode == MapMode::Colour && settings.layers.contours.enabled);
+    if show_contours {
+        output.push_str(&render_contours(scene, &transform, settings.mode, settings.layers.contours.opacity));
+    }
+
+    let show_layout = settings.mode != MapMode::Contour;
+    if show_layout {
+        output.push_str(&render_districts(
+            scene,
+            &transform,
+            &settings.districts,
+            settings.mode,
+            settings.layers.districts.opacity,
+        ));
+        output.push_str(&render_parks(scene, &transform, settings.mode, settings.layers.parks.opacity));
+        output.push_str(&render_segments(scene, &transform, &settings.roads, settings.mode, settings.layers.roads.opacity));
+        output.push_str(&render_routes(scene, &transform, &settings.transit, settings.mode, settings.layers.transit.opacity));
+        output.push_str(&render_buildings(scene, &transform, settings.mode, settings.layers.buildings.opacity));
+        output.push_str(&render_nodes(scene, &transform, settings.mode, settings.layers.nodes.opacity));
+        output.push_str(&render_labels(scene, &transform, settings.mode, settings.layers.labels.opacity));
+    }
 
     output.push_str("</svg>");
     output
 }
 
-fn render_segments(scene: &Scene, transform: &ViewportTransform, roads: &RoadLayers, opacity: f32) -> String {
+fn render_segments(scene: &Scene, transform: &ViewportTransform, roads: &RoadLayers, mode: MapMode, opacity: f32) -> String {
     let mut output = String::new();
     let sea_level = scene.document.metadata.sea_level;
 
@@ -65,27 +87,28 @@ fn render_segments(scene: &Scene, transform: &ViewportTransform, roads: &RoadLay
             continue;
         }
 
-        let elevation = elevation_state(
-            segment.underground,
-            segment.overground,
-            segment.elevated_hint,
-            segment
-                .points
-                .iter()
-                .map(|point| point.elevation)
-                .fold(f32::NEG_INFINITY, f32::max),
-            sea_level,
-        );
-        let style = segment_style(&segment.class, elevation);
-        let road = road_setting(roads, &segment.class);
-        if !road.enabled {
-            continue;
-        }
         let points = segment
             .points
             .iter()
             .map(|point| transform.map(point.position))
             .collect::<Vec<_>>();
+        if points.len() < 2 {
+            continue;
+        }
+
+        let elevation = elevation_state(
+            segment.underground,
+            segment.overground,
+            segment.elevated_hint,
+            segment.points.iter().map(|point| point.elevation).fold(f32::NEG_INFINITY, f32::max),
+            sea_level,
+        );
+        let style = segment_style(&segment.class, elevation, mode);
+        let road = road_setting(roads, &segment.class);
+        if !road.enabled {
+            continue;
+        }
+
         let path = polyline_path(&points);
         let dash_attr = if style.dash.is_empty() {
             String::new()
@@ -126,7 +149,7 @@ fn render_segments(scene: &Scene, transform: &ViewportTransform, roads: &RoadLay
     output
 }
 
-fn render_routes(scene: &Scene, transform: &ViewportTransform, transit: &TransitLayers, opacity: f32) -> String {
+fn render_routes(scene: &Scene, transform: &ViewportTransform, transit: &TransitLayers, mode: MapMode, opacity: f32) -> String {
     if scene.document.transports.is_empty() {
         return String::new();
     }
@@ -135,7 +158,7 @@ fn render_routes(scene: &Scene, transform: &ViewportTransform, transit: &Transit
     output.push_str("<g id=\"transit\">");
 
     for route in &scene.document.transports {
-        let style = route_style(route.kind, route.color);
+        let style = route_style(route.kind, route.color, mode);
         let setting = transit_setting(transit, route.kind);
         if !setting.enabled {
             continue;
@@ -150,6 +173,10 @@ fn render_routes(scene: &Scene, transform: &ViewportTransform, transit: &Transit
                         .iter()
                         .map(|point| transform.map(point.position))
                         .collect::<Vec<_>>();
+                    if points.len() < 2 {
+                        continue;
+                    }
+
                     let path = polyline_path(&points);
                     let _ = writeln!(
                         output,
@@ -191,7 +218,7 @@ fn route_links_for_route<'a>(
         .collect()
 }
 
-fn render_buildings(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
+fn render_buildings(scene: &Scene, transform: &ViewportTransform, mode: MapMode, opacity: f32) -> String {
     let mut output = String::new();
     output.push_str("<g id=\"buildings\">");
     for area in &scene.document.buildings {
@@ -199,12 +226,15 @@ fn render_buildings(scene: &Scene, transform: &ViewportTransform, opacity: f32) 
             continue;
         }
 
-        let style = building_style(&area.service, &area.subtype);
+        let style = building_style(&area.service, &area.subtype, mode);
         let points = area
             .points
             .iter()
             .map(|point| transform.map(*point))
             .collect::<Vec<_>>();
+        if points.len() < 3 {
+            continue;
+        }
         let _ = writeln!(
             output,
             "<polygon class=\"area\" points=\"{}\" fill=\"{}\" fill-opacity=\"{:.3}\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" data-id=\"{}\" data-service=\"{}\" data-subservice=\"{}\"/>",
@@ -223,7 +253,7 @@ fn render_buildings(scene: &Scene, transform: &ViewportTransform, opacity: f32) 
     output
 }
 
-fn render_parks(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
+fn render_parks(scene: &Scene, transform: &ViewportTransform, mode: MapMode, opacity: f32) -> String {
     let mut output = String::new();
     if scene.document.parks.is_empty() {
         return output;
@@ -235,13 +265,15 @@ fn render_parks(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> S
             continue;
         }
 
-        let style = park_style(area.area_type.as_deref());
-
+        let style = park_style(area.area_type.as_deref(), mode);
         let points = area
             .points
             .iter()
             .map(|point| transform.map(*point))
             .collect::<Vec<_>>();
+        if points.len() < 3 {
+            continue;
+        }
         let _ = writeln!(
             output,
             "<polygon class=\"area\" points=\"{}\" fill=\"{}\" fill-opacity=\"{:.3}\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" data-id=\"{}\" data-type=\"{}\"/>",
@@ -259,24 +291,27 @@ fn render_parks(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> S
     output
 }
 
-fn render_districts(scene: &Scene, transform: &ViewportTransform, districts: &BTreeMap<u64, DistrictSetting>, opacity: f32) -> String {
+fn render_districts(scene: &Scene, transform: &ViewportTransform, districts: &BTreeMap<u64, DistrictSetting>, mode: MapMode, opacity: f32) -> String {
     let mut output = String::new();
     if scene.document.districts.is_empty() {
         return output;
     }
 
     output.push_str("<g id=\"districts\">");
-    let style = district_style();
+    let style = district_style(mode);
     for district in &scene.document.districts {
         let setting = districts.get(&district.id).copied().unwrap_or_default();
         if !setting.enabled {
             continue;
         }
+
         let (x, y) = transform.map(district.anchor);
         let circle_radius = transform.map_size(3.0);
         let fill_opacity = style.opacity * opacity * setting.opacity;
         let stroke_opacity = style.opacity * opacity * setting.opacity;
+        let label_opacity = fill_opacity.clamp(0.0, 1.0);
         let label = escape_xml(&district.name);
+
         match setting.mode {
             DistrictMode::Badge => {
                 let _ = writeln!(
@@ -288,18 +323,19 @@ fn render_districts(scene: &Scene, transform: &ViewportTransform, districts: &BT
                 );
                 let _ = writeln!(
                     output,
-                    "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"#f4f2ea\" fill-opacity=\"{:.3}\">{label}</text>",
+                    "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\">{label}</text>",
                     y + circle_radius * 1.15,
-                    transform.map_size(15.0),
-                    fill_opacity.clamp(0.0, 1.0),
+                    transform.map_size(style.label_size),
+                    style.label.to_css(),
+                    label_opacity,
                 );
             }
             DistrictMode::Halo => {
                 let _ = writeln!(
                     output,
                     "<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\"/>",
-                    transform.map_size(7.5),
-                    style.fill.to_css(),
+                    transform.map_size(style.halo_radius * 0.42),
+                    style.halo.to_css(),
                     (fill_opacity * 0.35).clamp(0.0, 1.0),
                 );
                 let _ = writeln!(
@@ -313,9 +349,10 @@ fn render_districts(scene: &Scene, transform: &ViewportTransform, districts: &BT
             DistrictMode::Label => {
                 let _ = writeln!(
                     output,
-                    "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"#f4f2ea\" fill-opacity=\"{:.3}\">{label}</text>",
-                    transform.map_size(15.0),
-                    fill_opacity.clamp(0.0, 1.0),
+                    "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\">{label}</text>",
+                    transform.map_size(style.label_size),
+                    style.label.to_css(),
+                    label_opacity,
                 );
             }
             DistrictMode::Outline => {
@@ -332,7 +369,7 @@ fn render_districts(scene: &Scene, transform: &ViewportTransform, districts: &BT
     output
 }
 
-fn render_nodes(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
+fn render_nodes(scene: &Scene, transform: &ViewportTransform, mode: MapMode, opacity: f32) -> String {
     let mut output = String::new();
     output.push_str("<g id=\"nodes\">");
 
@@ -348,7 +385,7 @@ fn render_nodes(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> S
             node.elevation,
             scene.document.metadata.sea_level,
         );
-        let style = node_style(&node.kind);
+        let style = node_style(&node.kind, mode);
         let (x, y) = transform.map(node.position);
         let radius = transform.map_size(style.radius * if elevation == ElevationState::Elevated { 1.1 } else { 1.0 });
         let text_color = style.text.to_css();
@@ -441,7 +478,7 @@ fn render_nodes(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> S
             y + radius * 0.1,
             transform.map_size(style.radius * 1.15),
             text_color,
-            opacity.clamp(0.0, 1.0),
+            fill_opacity,
             style.letter,
         );
     }
@@ -450,13 +487,16 @@ fn render_nodes(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> S
     output
 }
 
-fn render_labels(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
+fn render_labels(scene: &Scene, transform: &ViewportTransform, mode: MapMode, opacity: f32) -> String {
     let mut output = String::new();
-    if scene.document.districts.is_empty() && scene.document.buildings.is_empty() && scene.document.parks.is_empty() && scene.document.transports.is_empty() {
+    if scene.document.buildings.is_empty() && scene.document.parks.is_empty() && scene.document.transports.is_empty() {
         return output;
     }
 
     output.push_str("<g id=\"labels\">");
+    let label_theme = label_style(mode);
+    let label_opacity = (label_theme.opacity * opacity).clamp(0.0, 1.0);
+
     for area in &scene.document.buildings {
         if !area.bounds.intersects(&transform.world) {
             continue;
@@ -472,9 +512,10 @@ fn render_labels(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> 
         let (x, y) = polygon_centroid(&points);
         let _ = writeln!(
             output,
-            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"#f4f2ea\" fill-opacity=\"{:.3}\">{}</text>",
+            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\">{}</text>",
             transform.map_size(13.0),
-            opacity.clamp(0.0, 1.0),
+            label_theme.fill.to_css(),
+            label_opacity,
             escape_xml(name),
         );
     }
@@ -492,9 +533,10 @@ fn render_labels(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> 
         let (x, y) = polygon_centroid(&points);
         let _ = writeln!(
             output,
-            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"#f4f2ea\" fill-opacity=\"{:.3}\">{}</text>",
+            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\">{}</text>",
             transform.map_size(12.5),
-            opacity.clamp(0.0, 1.0),
+            label_theme.fill.to_css(),
+            label_opacity,
             escape_xml(label),
         );
     }
@@ -521,10 +563,45 @@ fn render_labels(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> 
         let (x, y) = polygon_centroid(&points);
         let _ = writeln!(
             output,
-            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"#f4f2ea\" fill-opacity=\"{:.3}\">{}</text>",
+            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\">{}</text>",
             transform.map_size(11.0),
-            opacity.clamp(0.0, 1.0),
+            label_theme.fill.to_css(),
+            label_opacity,
             escape_xml(&route.name),
+        );
+    }
+
+    output.push_str("</g>");
+    output
+}
+
+fn render_contours(scene: &Scene, transform: &ViewportTransform, mode: MapMode, opacity: f32) -> String {
+    let mut output = String::new();
+    if scene.contours.is_empty() || opacity <= f32::EPSILON {
+        return output;
+    }
+
+    output.push_str("<g id=\"contours\">");
+    for contour in &scene.contours {
+        let style = contour_style(mode, contour.is_index);
+        let points = contour
+            .points
+            .iter()
+            .map(|point| transform.map(*point))
+            .collect::<Vec<_>>();
+        if points.len() < 2 {
+            continue;
+        }
+
+        let _ = writeln!(
+            output,
+            "<path class=\"segment\" d=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\" opacity=\"{:.3}\" data-elevation=\"{:.1}\" data-contour=\"{}\"/>",
+            polyline_path(&points),
+            style.stroke.to_css(),
+            transform.map_size(style.width),
+            style.opacity * opacity,
+            contour.elevation,
+            contour.is_index,
         );
     }
     output.push_str("</g>");
@@ -620,414 +697,3 @@ fn raster_layer_svg(layer: &RasterLayer, transform: &ViewportTransform, opacity:
         "<image x=\"{x:.2}\" y=\"{y:.2}\" width=\"{width:.2}\" height=\"{height:.2}\" opacity=\"{opacity:.3}\" preserveAspectRatio=\"none\" xlink:href=\"data:image/png;base64,{encoded}\"/>"
     )
 }
-/*
-use std::fmt::Write;
-
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-
-use crate::export::ExportSettings;
-use crate::model::{ElevationState, WorldPoint};
-use crate::scene::{RasterLayer, Scene};
-use crate::style::{
-    building_style, district_style, elevation_state, node_style, park_style, route_style,
-    segment_style, NodeShape,
-};
-use crate::viewport::{polygon_points, polyline_path, ViewportTransform};
-
-pub fn scene_to_svg(scene: &Scene, settings: &ExportSettings) -> String {
-    let bounds = settings.frame.unwrap_or(scene.bounds);
-    let transform = ViewportTransform::new(
-        bounds,
-        settings.width,
-        settings.height,
-        settings.padding,
-        settings.zoom,
-    );
-
-    let mut output = String::new();
-    let _ = write!(
-        output,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{}\" height=\"{}\" viewBox=\"{}\" shape-rendering=\"geometricPrecision\">\n<defs>\n  <style>\n    .text-ui {{ font-family: system-ui, sans-serif; }}\n    .label-shadow {{ paint-order: stroke fill; stroke: rgba(0, 0, 0, 0.58); stroke-width: 6; stroke-linejoin: round; }}\n    .segment {{ fill: none; stroke-linecap: round; stroke-linejoin: round; }}\n    .area {{ stroke-linejoin: round; stroke-linecap: round; }}\n  </style>\n</defs>\n",
-        settings.width,
-        settings.height,
-        transform.screen_rect(),
-    );
-
-    let _ = writeln!(output, "<rect width=\"100%\" height=\"100%\" fill=\"#0d1015\"/>");
-
-    if let Some(terrain) = scene.terrain.as_ref() {
-        let grid = terrain.sample_grid(bounds, terrain_resolution);
-        output.push_str(&grid.to_svg(&transform));
-    }
-    if let Some(forests) = scene.forests.as_ref() {
-        let grid = forests.sample_grid(bounds, terrain_resolution);
-        output.push_str(&grid.to_svg(&transform));
-    }
-
-    output.push_str(&render_districts(scene, &transform));
-    output.push_str(&render_parks(scene, &transform));
-    output.push_str(&render_segments(scene, &transform));
-    output.push_str(&render_routes(scene, &transform));
-    output.push_str(&render_buildings(scene, &transform));
-    output.push_str(&render_nodes(scene, &transform));
-    output.push_str(&render_labels(scene, &transform));
-
-    output.push_str("</svg>");
-    output
-}
-
-fn render_segments(scene: &Scene, transform: &ViewportTransform) -> String {
-    let mut output = String::new();
-    let sea_level = scene.document.metadata.sea_level;
-
-    output.push_str("<g id=\"segments\">");
-    for segment in &scene.document.segments {
-        if !segment.bounds.intersects(&transform.world) {
-            continue;
-        }
-
-        let elevation = elevation_state(
-            segment.underground,
-            segment.overground,
-            segment.elevated_hint,
-            segment
-                .points
-                .iter()
-                .map(|point| point.elevation)
-                .fold(f32::NEG_INFINITY, f32::max),
-            sea_level,
-        );
-        let style = segment_style(&segment.class, elevation);
-        let points = segment
-            .points
-            .iter()
-            .map(|point| transform.map(point.position))
-            .collect::<Vec<_>>();
-        let path = polyline_path(&points);
-        let dash_attr = if style.dash.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " stroke-dasharray=\"{}\"",
-                style
-                    .dash
-                    .iter()
-                    .map(|value| format!("{value:.1}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
-
-        let _ = writeln!(
-            output,
-            "<path class=\"segment\" d=\"{path}\" stroke=\"{}\" stroke-width=\"{:.2}\" opacity=\"{:.3}\"{} data-id=\"{}\" data-class=\"{}\"/>",
-            style.casing.to_css(),
-            transform.map_size(segment.width + style.casing_extra),
-            style.opacity,
-            dash_attr,
-            segment.id,
-            escape_xml(segment.class.raw_label()),
-        );
-        let _ = writeln!(
-            output,
-            "<path class=\"segment\" d=\"{path}\" stroke=\"{}\" stroke-width=\"{:.2}\" opacity=\"{:.3}\"{} data-id=\"{}\" data-class=\"{}\"/>",
-            style.body.to_css(),
-            transform.map_size(segment.width * style.body_scale),
-            style.opacity,
-            dash_attr,
-            segment.id,
-            escape_xml(segment.class.raw_label()),
-        );
-    }
-    output.push_str("</g>");
-    output
-}
-
-fn render_routes(scene: &Scene, transform: &ViewportTransform) -> String {
-    if scene.document.transports.is_empty() {
-        return String::new();
-    }
-
-    let mut output = String::new();
-    output.push_str("<g id=\"transit\">");
-
-    for route in &scene.document.transports {
-        let style = route_style(route.kind, route.color);
-        let route_label = escape_xml(&route.name);
-
-        for link in route_links_for_route(scene, route) {
-            for segment_id in &link.segment_ids {
-                if let Some(segment) = scene.document.segments.iter().find(|segment| segment.id == *segment_id) {
-                    let points = segment
-                        .points
-                        .iter()
-                        .map(|point| transform.map(point.position))
-                        .collect::<Vec<_>>();
-                    let path = polyline_path(&points);
-                    let _ = writeln!(
-                        output,
-                        "<path class=\"segment\" d=\"{path}\" stroke=\"{}\" stroke-width=\"{:.2}\" opacity=\"{:.3}\" data-route=\"{}\" data-link=\"{}-{}\"/>",
-                        style.stroke.to_css(),
-                        transform.map_size((segment.width * 0.6).max(style.stroke_width)),
-                        style.opacity,
-                        route_label,
-                        link.start_node,
-                        link.end_node,
-                    );
-                }
-            }
-        }
-    }
-
-    output.push_str("</g>");
-    output
-}
-
-fn route_links_for_route<'a>(
-    scene: &'a Scene,
-    route: &'a crate::model::TransportRecord,
-) -> Vec<&'a crate::model::RouteLinkRecord> {
-    if route.stops.len() < 2 {
-        return Vec::new();
-    }
-
-    scene
-        .document
-        .route_links
-        .iter()
-        .filter(|link| {
-            route
-                .stops
-                .windows(2)
-                .any(|pair| pair[0] == link.start_node && pair[1] == link.end_node)
-        })
-        .collect()
-}
-
-fn render_buildings(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
-    let mut output = String::new();
-    output.push_str("<g id=\"buildings\">");
-    for area in &scene.document.buildings {
-        if !area.bounds.intersects(&transform.world) {
-            continue;
-        }
-
-        let style = building_style(&area.service, &area.subtype);
-        let points = area
-            .points
-            .iter()
-            .map(|point| transform.map(*point))
-            .collect::<Vec<_>>();
-        let _ = writeln!(
-            output,
-            "<polygon class=\"area\" points=\"{}\" fill=\"{}\" fill-opacity=\"{:.3}\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" data-id=\"{}\" data-service=\"{}\" data-subservice=\"{}\"/>",
-            polygon_points(&points),
-            style.fill.to_css(),
-            style.opacity * opacity,
-            style.stroke.to_css(),
-            style.opacity * opacity,
-            transform.map_size(style.stroke_width),
-            area.id,
-            escape_xml(&area.service),
-            escape_xml(&area.subtype),
-        );
-    }
-    output.push_str("</g>");
-    output
-}
-
-fn render_parks(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
-    let mut output = String::new();
-    if scene.document.parks.is_empty() {
-        return output;
-    }
-
-    output.push_str("<g id=\"parks\">");
-    let style = park_style();
-    for area in &scene.document.parks {
-        if !area.bounds.intersects(&transform.world) {
-            continue;
-        }
-
-        let points = area
-            .points
-            .iter()
-            .map(|point| transform.map(*point))
-            .collect::<Vec<_>>();
-        let _ = writeln!(
-            output,
-            "<polygon class=\"area\" points=\"{}\" fill=\"{}\" fill-opacity=\"{:.3}\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\" data-id=\"{}\" data-type=\"{}\"/>",
-            polygon_points(&points),
-            style.fill.to_css(),
-            style.opacity * opacity,
-            style.stroke.to_css(),
-            style.opacity * opacity,
-            transform.map_size(style.stroke_width),
-            area.id,
-            escape_xml(area.area_type.as_deref().unwrap_or("Park")),
-        );
-    }
-    output.push_str("</g>");
-    output
-}
-
-fn render_districts(scene: &Scene, transform: &ViewportTransform, opacity: f32) -> String {
-    let mut output = String::new();
-    if scene.document.districts.is_empty() {
-        return output;
-    }
-
-    output.push_str("<g id=\"districts\">");
-    let style = district_style();
-    for district in &scene.document.districts {
-        let (x, y) = transform.map(district.anchor);
-        let _ = writeln!(
-            output,
-            "<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"{:.2}\" fill=\"{}\" fill-opacity=\"{:.3}\" stroke=\"{}\" stroke-opacity=\"{:.3}\" stroke-width=\"{:.2}\"/>",
-            transform.map_size(3.0),
-            style.fill.to_css(),
-            style.opacity * opacity,
-            style.stroke.to_css(),
-            style.opacity * opacity,
-            transform.map_size(style.stroke_width),
-        );
-    }
-    output.push_str("</g>");
-    output
-}
-
-fn render_nodes(scene: &Scene, transform: &ViewportTransform) -> String {
-    let mut output = String::new();
-    output.push_str("<g id=\"nodes\">");
-
-    for node in &scene.document.nodes {
-        if !transform.world.contains_point(node.position) {
-            continue;
-        }
-
-        let elevation = elevation_state(
-            node.underground,
-            node.overground,
-            false,
-            node.elevation,
-            scene.document.metadata.sea_level,
-        );
-        let style = node_style(&node.kind);
-        let (x, y) = transform.map(node.position);
-        let radius = transform.map_size(style.radius * if elevation == ElevationState::Elevated { 1.1 } else { 1.0 });
-        let text_color = style.text.to_css();
-
-        let shape = match style.shape {
-            NodeShape::Circle => format!(
-                "<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"{radius:.2}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
-                style.fill.to_css(),
-                style.stroke.to_css(),
-                transform.map_size(1.6)
-            ),
-            NodeShape::Square => format!(
-                "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{:.2}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\" transform=\"rotate(45 {:.2} {:.2})\"/>",
-                x - radius,
-                y - radius,
-                radius * 2.0,
-                radius * 2.0,
-                radius * 0.22,
-                style.fill.to_css(),
-                style.stroke.to_css(),
-                transform.map_size(1.5),
-                x,
-                y
-            ),
-            NodeShape::Diamond => format!(
-                "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
-                x,
-                y - radius,
-                x + radius,
-                y,
-                x,
-                y + radius,
-                x - radius,
-                y,
-                style.fill.to_css(),
-                style.stroke.to_css(),
-                transform.map_size(1.6)
-            ),
-            NodeShape::Hexagon => {
-                let half = radius * 0.92;
-                format!(
-                    "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
-                    x - half * 0.5,
-                    y - radius,
-                    x + half * 0.5,
-                    y - radius,
-                    x + radius,
-                    y,
-                    x + half * 0.5,
-                    y + radius,
-                    x - half * 0.5,
-                    y + radius,
-                    x - radius,
-                    y,
-                    style.fill.to_css(),
-                    style.stroke.to_css(),
-                    transform.map_size(1.6)
-                )
-            }
-            NodeShape::Triangle => format!(
-                "<polygon points=\"{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{:.2}\"/>",
-                x,
-                y - radius,
-                x + radius,
-                y + radius,
-                x - radius,
-                y + radius,
-                style.fill.to_css(),
-                style.stroke.to_css(),
-                transform.map_size(1.6)
-            ),
-        };
-        output.push_str(&shape);
-
-        let _ = writeln!(
-            output,
-            "<text class=\"text-ui\" x=\"{x:.2}\" y=\"{:.2}\" font-size=\"{:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"{}\">{}</text>",
-            y + radius * 0.1,
-            transform.map_size(style.radius * 1.15),
-            text_color,
-            style.letter,
-        );
-    }
-
-    output.push_str("</g>");
-    output
-}
-
-fn render_labels(scene: &Scene, transform: &ViewportTransform) -> String {
-    let mut output = String::new();
-    if scene.document.districts.is_empty() {
-        return output;
-    }
-
-    output.push_str("<g id=\"labels\">");
-    for district in &scene.document.districts {
-        let (x, y) = transform.map(district.anchor);
-        let _ = writeln!(
-            output,
-            "<text class=\"text-ui label-shadow\" x=\"{x:.2}\" y=\"{y:.2}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"{:.2}\" fill=\"#f4f2ea\">{}</text>",
-            transform.map_size(15.0),
-            escape_xml(&district.name),
-        );
-    }
-    output.push_str("</g>");
-    output
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-*/

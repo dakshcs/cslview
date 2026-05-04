@@ -7,13 +7,15 @@ use eframe::egui::{self, Color32, FontId, PointerButton, Pos2, Rect, Sense, Stro
 
 use crate::export::{
     export_to_file, DistrictMode, DistrictSetting, ExportKind, ExportSettings, LayerSetting,
-    LayerSettings, RoadLayers, TransitLayers,
+    LayerSettings, MapMode, RoadLayers, TransitLayers,
 };
 use crate::model::{AreaRecord, SegmentRecord, WorldBounds, WorldPoint};
 use crate::parser::parse_csl_file;
 use crate::scene::{build_scene, RasterLayer, Scene};
-use crate::theme::theme;
-use crate::style::{elevation_state, node_style, park_path_style, park_style, segment_style};
+use crate::style::{
+    background_color, contour_style, district_style, elevation_state, label_style, node_style,
+    park_path_style, park_style, route_style, segment_style,
+};
 use crate::viewport::distance_point_to_polyline;
 
 const NODE_HIDE_SCREEN_RADIUS: f32 = 3.0;
@@ -134,6 +136,7 @@ pub struct CslViewApp {
     roads: RoadLayers,
     transit: TransitLayers,
     districts: BTreeMap<u64, DistrictSetting>,
+    map_mode: MapMode,
     export_size: u32,
     current_file: Option<PathBuf>,
     last_error: Option<String>,
@@ -158,6 +161,7 @@ impl Default for CslViewApp {
             roads: RoadLayers::default(),
             transit: TransitLayers::default(),
             districts: BTreeMap::new(),
+            map_mode: MapMode::default(),
             export_size: 4096,
             current_file: None,
             last_error: None,
@@ -239,7 +243,9 @@ impl CslViewApp {
         settings.layers.buildings.enabled.hash(&mut h);
         settings.layers.transit.enabled.hash(&mut h);
         settings.layers.labels.enabled.hash(&mut h);
+        settings.layers.contours.enabled.hash(&mut h);
         // Cast f32 bits to u64 so they're hashable
+        settings.mode.index().hash(&mut h);
         (settings.zoom.to_bits() as u64).hash(&mut h);
         (settings.padding.to_bits() as u64).hash(&mut h);
         h.finish()
@@ -272,6 +278,7 @@ impl CslViewApp {
             Some(rect) => Some(self.camera.visible_world_bounds(scene.bounds, rect)),
             None => Some(scene.bounds),
         };
+        settings.mode = self.map_mode;
         settings.layers = self.layers;
         settings.roads = self.roads;
         settings.transit = self.transit;
@@ -419,6 +426,7 @@ impl CslViewApp {
         bounds: WorldBounds,
         rect: Rect,
         sea_level: f32,
+        mode: MapMode,
         opacity: f32,
         selected: bool,
     ) {
@@ -429,7 +437,7 @@ impl CslViewApp {
             segment.points.iter().map(|point| point.elevation).fold(f32::NEG_INFINITY, f32::max),
             sea_level,
         );
-        let style = segment_style(&segment.class, elevation);
+        let style = segment_style(&segment.class, elevation, mode);
         let opacity = (style.opacity * opacity).clamp(0.0, 1.0);
         let screen_points = segment
             .points
@@ -497,14 +505,17 @@ impl CslViewApp {
         bounds: WorldBounds,
         rect: Rect,
         setting: DistrictSetting,
+        mode: MapMode,
     ) {
         if !setting.enabled {
             return;
         }
 
-        let district_theme = &theme().districts;
+        let district_theme = district_style(mode);
+        let label_theme = label_style(mode);
         let center = camera.world_to_screen(district.anchor, bounds, rect);
-        let opacity = setting.opacity.clamp(0.0, 1.0);
+        let opacity = (district_theme.opacity * setting.opacity).clamp(0.0, 1.0);
+        let label_opacity = (label_theme.opacity * opacity).clamp(0.0, 1.0);
         let fill = Color32::from_rgba_unmultiplied(
             district_theme.fill.r,
             district_theme.fill.g,
@@ -518,16 +529,16 @@ impl CslViewApp {
             multiply_alpha(district_theme.stroke.a, opacity),
         );
         let label = Color32::from_rgba_unmultiplied(
-            district_theme.label.r,
-            district_theme.label.g,
-            district_theme.label.b,
-            multiply_alpha(district_theme.label.a, opacity),
+            label_theme.fill.r,
+            label_theme.fill.g,
+            label_theme.fill.b,
+            multiply_alpha(label_theme.fill.a, label_opacity),
         );
         let halo = Color32::from_rgba_unmultiplied(
             district_theme.halo.r,
             district_theme.halo.g,
             district_theme.halo.b,
-            multiply_alpha(district_theme.halo.a, opacity * 0.3),
+            multiply_alpha(district_theme.halo.a, label_opacity * 0.3),
         );
         let radius = district_theme.halo_radius.max(12.0);
 
@@ -563,9 +574,10 @@ impl CslViewApp {
         camera: &Camera,
         bounds: WorldBounds,
         rect: Rect,
+        mode: MapMode,
         opacity: f32,
     ) {
-        let style = park_path_style();
+        let style = park_path_style(mode);
         let path_opacity = (style.opacity * opacity).clamp(0.0, 1.0);
         let casing = color_with_opacity(rgba_to_color32(style.casing), path_opacity * 0.65);
         let body = color_with_opacity(rgba_to_color32(style.body), path_opacity);
@@ -597,25 +609,59 @@ impl CslViewApp {
         }
     }
 
+    fn draw_contours(
+        painter: &egui::Painter,
+        scene: &Scene,
+        camera: &Camera,
+        bounds: WorldBounds,
+        rect: Rect,
+        mode: MapMode,
+        opacity: f32,
+    ) {
+        if opacity <= f32::EPSILON || scene.contours.is_empty() {
+            return;
+        }
+
+        let scale = camera.fit_scale(bounds, rect);
+        for contour in &scene.contours {
+            let style = contour_style(mode, contour.is_index);
+            let points = contour
+                .points
+                .iter()
+                .map(|point| camera.world_to_screen(*point, bounds, rect))
+                .collect::<Vec<_>>();
+            if points.len() < 2 {
+                continue;
+            }
+
+            let stroke = Stroke::new(
+                style.width * scale,
+                color_with_opacity(rgba_to_color32(style.stroke), (style.opacity * opacity).clamp(0.0, 1.0)),
+            );
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
+
     fn draw_label(
         painter: &egui::Painter,
         text: &str,
         center: Pos2,
         font_size: f32,
+        style: crate::style::LabelStyle,
         opacity: f32,
     ) {
-        let label_theme = &theme().labels;
+        let opacity = (style.opacity * opacity).clamp(0.0, 1.0);
         let shadow = Color32::from_rgba_unmultiplied(
-            label_theme.shadow.r,
-            label_theme.shadow.g,
-            label_theme.shadow.b,
-            multiply_alpha(label_theme.shadow.a, opacity),
+            style.shadow.r,
+            style.shadow.g,
+            style.shadow.b,
+            multiply_alpha(style.shadow.a, opacity),
         );
         let fill = Color32::from_rgba_unmultiplied(
-            label_theme.fill.r,
-            label_theme.fill.g,
-            label_theme.fill.b,
-            multiply_alpha(label_theme.fill.a, opacity),
+            style.fill.r,
+            style.fill.g,
+            style.fill.b,
+            multiply_alpha(style.fill.a, opacity),
         );
         painter.text(
             center + Vec2::new(1.0, 1.5),
@@ -639,11 +685,12 @@ impl CslViewApp {
         camera: &Camera,
         bounds: WorldBounds,
         rect: Rect,
+        mode: MapMode,
         opacity: f32,
         selected: Option<Selection>,
     ) {
         for node in &scene.document.nodes {
-            let style = node_style(&node.kind);
+            let style = node_style(&node.kind, mode);
             let center = camera.world_to_screen(node.position, bounds, rect);
             let scale = camera.fit_scale(bounds, rect);
             let radius = style.radius * scale;
@@ -694,11 +741,13 @@ impl CslViewApp {
         camera: &Camera,
         bounds: WorldBounds,
         rect: Rect,
+        mode: MapMode,
         opacity: f32,
     ) {
         let scale = camera.fit_scale(bounds, rect);
         let visible = camera.visible_world_bounds(bounds, rect);
-        let label_opacity = (theme().labels.opacity * opacity).clamp(0.0, 1.0);
+        let label_theme = label_style(mode);
+        let label_opacity = (label_theme.opacity * opacity).clamp(0.0, 1.0);
 
         for area in &scene.document.buildings {
             if !area.bounds.intersects(&visible) || area.points.len() < 3 {
@@ -715,7 +764,7 @@ impl CslViewApp {
             let center = polygon_centroid(&points);
             let font_size = (11.0 * scale).clamp(8.0, 22.0);
             if font_size >= 8.0 {
-                Self::draw_label(painter, name, center, font_size, label_opacity);
+                Self::draw_label(painter, name, center, font_size, label_theme, label_opacity);
             }
         }
 
@@ -732,7 +781,7 @@ impl CslViewApp {
             let center = polygon_centroid(&points);
             let font_size = (11.5 * scale).clamp(8.0, 22.0);
             if font_size >= 8.0 {
-                Self::draw_label(painter, label, center, font_size, label_opacity);
+                Self::draw_label(painter, label, center, font_size, label_theme, label_opacity);
             }
         }
 
@@ -762,7 +811,7 @@ impl CslViewApp {
             }
             let center = polygon_centroid(&points);
             let font_size = (10.0 * scale).clamp(8.0, 18.0);
-            Self::draw_label(painter, &route.name, center, font_size, label_opacity * 0.9);
+            Self::draw_label(painter, &route.name, center, font_size, label_theme, label_opacity * 0.9);
         }
     }
 
@@ -795,13 +844,17 @@ impl CslViewApp {
     }
 
     fn hit_test(&self, scene: &Scene, rect: Rect, pointer: Pos2) -> Option<Selection> {
+        if self.map_mode == MapMode::Contour {
+            return None;
+        }
+
         let bounds = scene.bounds;
         let world = self.camera.screen_to_world(pointer, bounds, rect);
         let mut best: Option<(f32, Selection)> = None;
         let scale = self.camera.fit_scale(bounds, rect).max(0.001);
 
         for node in &scene.document.nodes {
-            let style = node_style(&node.kind);
+            let style = node_style(&node.kind, self.map_mode);
             if style.radius * scale < NODE_HIDE_SCREEN_RADIUS {
                 continue;
             }
@@ -994,9 +1047,20 @@ impl eframe::App for CslViewApp {
                     });
 
                     ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Palette");
+                        let mut mode_index = self.map_mode.index();
+                        let response = ui.add(egui::Slider::new(&mut mode_index, 0..=2).show_value(false));
+                        if response.changed() {
+                            self.map_mode = MapMode::from_index(mode_index);
+                        }
+                        ui.label(self.map_mode.label());
+                    });
+                    ui.separator();
                     ui.label("Layers");
                     layer_control(ui, "Terrain", &mut self.layers.terrain);
                     layer_control(ui, "Forests", &mut self.layers.forests);
+                    layer_control(ui, "Contours", &mut self.layers.contours);
                     layer_control(ui, "Districts", &mut self.layers.districts);
                     layer_control(ui, "Parks", &mut self.layers.parks);
                     layer_control(ui, "Roads", &mut self.layers.roads);
@@ -1127,6 +1191,7 @@ impl eframe::App for CslViewApp {
             let painter = ui.painter_at(rect);
             let bounds = scene.bounds;
             let visible = self.camera.visible_world_bounds(bounds, rect);
+            painter.rect_filled(rect, 0.0, rgba_to_color32(background_color(self.map_mode)));
 
             //let modifiers = ctx.input(|input| input.modifiers);
             let pointer_delta = ctx.input(|input| input.pointer.delta());
@@ -1179,11 +1244,13 @@ impl eframe::App for CslViewApp {
                 }
             }
 
-            if self.layers.grid.enabled {
+            let show_layout = self.map_mode != MapMode::Contour;
+
+            if show_layout && self.layers.grid.enabled {
                 Self::draw_grid(&painter, bounds, &self.camera, rect, self.layers.grid.opacity);
             }
 
-            if self.layers.terrain.enabled {
+            if self.layers.terrain.enabled && self.map_mode == MapMode::Colour {
                 if let Some(layer) = scene.terrain.as_ref() {
                     if let Some(texture) = self.terrain_texture.as_ref() {
                         Self::draw_raster_layer(&painter, layer, texture, &self.camera, bounds, rect, self.layers.terrain.opacity);
@@ -1191,7 +1258,7 @@ impl eframe::App for CslViewApp {
                 }
             }
 
-            if self.layers.forests.enabled {
+            if self.layers.forests.enabled && self.map_mode == MapMode::Colour {
                 if let Some(layer) = scene.forests.as_ref() {
                     if let Some(texture) = self.forest_texture.as_ref() {
                         Self::draw_raster_layer(&painter, layer, texture, &self.camera, bounds, rect, self.layers.forests.opacity);
@@ -1199,19 +1266,25 @@ impl eframe::App for CslViewApp {
                 }
             }
 
-            if self.layers.districts.enabled {
+            let show_contours = self.map_mode == MapMode::Contour
+                || (self.map_mode == MapMode::Colour && self.layers.contours.enabled);
+            if show_contours {
+                Self::draw_contours(&painter, scene, &self.camera, bounds, rect, self.map_mode, self.layers.contours.opacity);
+            }
+
+            if show_layout && self.layers.districts.enabled {
                 for district in &scene.document.districts {
                     let setting = self.districts.get(&district.id).copied().unwrap_or_default();
-                    Self::draw_district_marker(&painter, district, &self.camera, bounds, rect, setting);
+                    Self::draw_district_marker(&painter, district, &self.camera, bounds, rect, setting, self.map_mode);
                 }
             }
 
-            if self.layers.parks.enabled {
+            if show_layout && self.layers.parks.enabled {
                 for area in &scene.document.parks {
                     if !area.bounds.intersects(&visible) {
                         continue;
                     }
-                    let style = park_style(area.area_type.as_deref());
+                    let style = park_style(area.area_type.as_deref(), self.map_mode);
                     Self::draw_detailed_area(
                         &painter,
                         area,
@@ -1225,11 +1298,11 @@ impl eframe::App for CslViewApp {
                         0.08,
                         Vec2::new(1.0, -1.0),
                     );
-                    Self::draw_park_paths(&painter, scene, area, &self.camera, bounds, rect, self.layers.parks.opacity);
+                    Self::draw_park_paths(&painter, scene, area, &self.camera, bounds, rect, self.map_mode, self.layers.parks.opacity);
                 }
             }
 
-            if self.layers.roads.enabled {
+            if show_layout && self.layers.roads.enabled {
                 for segment in &scene.document.segments {
                     if !segment.bounds.intersects(&visible) {
                         continue;
@@ -1246,18 +1319,20 @@ impl eframe::App for CslViewApp {
                         bounds,
                         rect,
                         scene.document.metadata.sea_level,
+                        self.map_mode,
                         self.layers.roads.opacity * setting.opacity,
                         selected,
                     );
                 }
             }
 
-            if self.layers.transit.enabled {
+            if show_layout && self.layers.transit.enabled {
                 for route in &scene.document.transports {
                     let setting = transit_setting(&self.transit, route.kind);
                     if !setting.enabled || route.stops.len() < 2 {
                         continue;
                     }
+                    let route_style = route_style(route.kind, route.color, self.map_mode);
                     for link in &scene.document.route_links {
                         if !route.stops.windows(2).any(|pair| pair[0] == link.start_node && pair[1] == link.end_node) {
                             continue;
@@ -1269,12 +1344,14 @@ impl eframe::App for CslViewApp {
                                     .iter()
                                     .map(|point| self.camera.world_to_screen(point.position, bounds, rect))
                                     .collect::<Vec<_>>();
-                                let route_color = Color32::from_rgba_unmultiplied(route.color.r, route.color.g, route.color.b, route.color.a);
                                 Self::draw_polyline(
                                     &painter,
                                     points,
-                                    color_with_opacity(route_color, self.layers.transit.opacity * setting.opacity),
-                                    3.5,
+                                    color_with_opacity(
+                                        rgba_to_color32(route_style.stroke),
+                                        self.layers.transit.opacity * setting.opacity * route_style.opacity,
+                                    ),
+                                    route_style.stroke_width,
                                     &[],
                                 );
                             }
@@ -1283,12 +1360,12 @@ impl eframe::App for CslViewApp {
                 }
             }
 
-            if self.layers.buildings.enabled {
+            if show_layout && self.layers.buildings.enabled {
                 for area in &scene.document.buildings {
                     if !area.bounds.intersects(&visible) {
                         continue;
                     }
-                    let style = crate::style::building_style(&area.service, &area.subtype);
+                    let style = crate::style::building_style(&area.service, &area.subtype, self.map_mode);
                     Self::draw_detailed_area(
                         &painter,
                         area,
@@ -1305,12 +1382,12 @@ impl eframe::App for CslViewApp {
                 }
             }
 
-            if self.layers.nodes.enabled {
-                Self::draw_nodes(&painter, scene, &self.camera, bounds, rect, self.layers.nodes.opacity, self.selected);
+            if show_layout && self.layers.nodes.enabled {
+                Self::draw_nodes(&painter, scene, &self.camera, bounds, rect, self.map_mode, self.layers.nodes.opacity, self.selected);
             }
 
-            if self.layers.labels.enabled {
-                Self::draw_labels(&painter, scene, &self.camera, bounds, rect, self.layers.labels.opacity);
+            if show_layout && self.layers.labels.enabled {
+                Self::draw_labels(&painter, scene, &self.camera, bounds, rect, self.map_mode, self.layers.labels.opacity);
             }
 
             self.hovered = response

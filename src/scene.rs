@@ -4,8 +4,12 @@ use anyhow::Result;
 use eframe::egui::ColorImage;
 use resvg::tiny_skia::Pixmap;
 
-use crate::model::{MapDocument, RasterKind, WorldBounds};
+use crate::model::{MapDocument, RasterKind, WorldBounds, WorldPoint};
 use crate::theme::theme;
+
+const CONTOUR_INTERVAL: f32 = 25.0;
+const CONTOUR_INDEX_STEP: usize = 4;
+const CONTOUR_EPSILON: f32 = 0.001;
 
 #[derive(Debug, Clone)]
 pub struct RasterLayer {
@@ -15,6 +19,14 @@ pub struct RasterLayer {
     pub pixels: Vec<u8>,
     pub world_bounds: WorldBounds,
     pub opacity: f32,
+    pub heights: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContourLine {
+    pub elevation: f32,
+    pub is_index: bool,
+    pub points: Vec<WorldPoint>,
 }
 
 impl RasterLayer {
@@ -43,6 +55,7 @@ pub struct Scene {
     pub bounds: WorldBounds,
     pub segment_index: HashMap<u64, usize>,
     pub node_index: HashMap<u64, usize>,
+    pub contours: Vec<ContourLine>,
     pub terrain: Option<RasterLayer>,
     pub forests: Option<RasterLayer>,
 }
@@ -78,6 +91,10 @@ pub fn build_scene(document: MapDocument) -> Scene {
         .forests
         .as_ref()
         .and_then(|source| decode_forest_layer(source, bounds));
+    let contours = terrain
+        .as_ref()
+        .map(|layer| generate_contours(layer, document.metadata.sea_level))
+        .unwrap_or_default();
 
     if bounds.is_empty() {
         if let Some(terrain_surface) = terrain.as_ref() {
@@ -111,6 +128,7 @@ pub fn build_scene(document: MapDocument) -> Scene {
         bounds,
         segment_index,
         node_index,
+        contours,
         terrain,
         forests,
     }
@@ -139,14 +157,23 @@ fn decode_terrain_layer(source: &crate::model::RasterSource, world_bounds: World
         world_bounds
     };
 
+    let mut heights = vec![0.0f32; side * side];
+    for index in 0..(side * side) {
+        heights[index] = tokens[index * 2].parse::<f32>().unwrap_or(sea_level) * 0.01;
+    }
+
+    let heights = smooth_heights(heights, side, side, 3);
+    let shade = compute_hillshade(&heights, side, side);
+
     let mut pixels = vec![0u8; side * side * 4];
     for index in 0..(side * side) {
-        let height = tokens[index * 2].parse::<f32>().unwrap_or(sea_level) * 0.01;
-        let color = terrain_color(height, sea_level);
+        let color = terrain_color(heights[index], sea_level);
+        let s = shade[index];
+        let s_soft = s * 0.88 + 0.12;
         let base = index * 4;
-        pixels[base] = color.r;
-        pixels[base + 1] = color.g;
-        pixels[base + 2] = color.b;
+        pixels[base] = (color.r as f32 * s_soft).round().clamp(0.0, 255.0) as u8;
+        pixels[base + 1] = (color.g as f32 * s_soft).round().clamp(0.0, 255.0) as u8;
+        pixels[base + 2] = (color.b as f32 * s_soft).round().clamp(0.0, 255.0) as u8;
         pixels[base + 3] = color.a;
     }
 
@@ -157,6 +184,7 @@ fn decode_terrain_layer(source: &crate::model::RasterSource, world_bounds: World
         pixels,
         world_bounds,
         opacity: 1.0,
+        heights,
     })
 }
 
@@ -208,7 +236,223 @@ fn decode_forest_layer(source: &crate::model::RasterSource, world_bounds: WorldB
         pixels,
         world_bounds,
         opacity: 1.0,
+        heights: Vec::new(),
     })
+}
+
+fn generate_contours(layer: &RasterLayer, sea_level: f32) -> Vec<ContourLine> {
+    let width = layer.width as usize;
+    let height = layer.height as usize;
+    if width < 2 || height < 2 || layer.heights.len() != width * height {
+        return Vec::new();
+    }
+
+    let min_height = layer.heights.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_height = layer.heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !min_height.is_finite() || !max_height.is_finite() || max_height <= sea_level {
+        return Vec::new();
+    }
+
+    let mut level = (sea_level.max(min_height) / CONTOUR_INTERVAL).ceil() * CONTOUR_INTERVAL;
+    let mut contours = Vec::new();
+    let mut contour_index = 0usize;
+
+    while level <= max_height {
+        let polylines = march_contours(&layer.heights, width, height, level, layer.world_bounds);
+        if !polylines.is_empty() {
+            let is_index = contour_index % CONTOUR_INDEX_STEP == 0;
+            for points in polylines {
+                contours.push(ContourLine { elevation: level, is_index, points });
+            }
+        }
+        level += CONTOUR_INTERVAL;
+        contour_index += 1;
+    }
+
+    contours
+}
+
+fn march_contours(heights: &[f32], width: usize, height: usize, level: f32, bounds: WorldBounds) -> Vec<Vec<WorldPoint>> {
+    if width < 2 || height < 2 {
+        return Vec::new();
+    }
+
+    let cell_width = bounds.width() / (width - 1) as f32;
+    let cell_height = bounds.height() / (height - 1) as f32;
+    let interp = |a: f32, b: f32| -> f32 {
+        if (b - a).abs() < f32::EPSILON {
+            0.5
+        } else {
+            ((level - a) / (b - a)).clamp(0.0, 1.0)
+        }
+    };
+
+    let mut segments = Vec::new();
+
+    for row in 0..(height - 1) {
+        let y_top = bounds.max_y - row as f32 * cell_height;
+        let y_bottom = y_top - cell_height;
+        for col in 0..(width - 1) {
+            let x_left = bounds.min_x + col as f32 * cell_width;
+            let x_right = x_left + cell_width;
+
+            let h00 = heights[row * width + col];
+            let h10 = heights[row * width + col + 1];
+            let h01 = heights[(row + 1) * width + col];
+            let h11 = heights[(row + 1) * width + col + 1];
+
+            let case_index = ((h00 >= level) as u8)
+                | (((h10 >= level) as u8) << 1)
+                | (((h11 >= level) as u8) << 2)
+                | (((h01 >= level) as u8) << 3);
+
+            if case_index == 0 || case_index == 15 {
+                continue;
+            }
+
+            let top = WorldPoint::new(x_left + interp(h00, h10) * cell_width, y_top);
+            let bottom = WorldPoint::new(x_left + interp(h01, h11) * cell_width, y_bottom);
+            let left = WorldPoint::new(x_left, y_top - interp(h00, h01) * cell_height);
+            let right = WorldPoint::new(x_right, y_top - interp(h10, h11) * cell_height);
+
+            match case_index {
+                1 | 14 => segments.push((top, left)),
+                2 | 13 => segments.push((top, right)),
+                3 | 12 => segments.push((left, right)),
+                4 | 11 => segments.push((bottom, right)),
+                6 | 9 => segments.push((top, bottom)),
+                7 | 8 => segments.push((bottom, left)),
+                5 => {
+                    segments.push((top, right));
+                    segments.push((bottom, left));
+                }
+                10 => {
+                    segments.push((top, left));
+                    segments.push((bottom, right));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    chain_segments(segments)
+}
+
+fn chain_segments(mut segments: Vec<(WorldPoint, WorldPoint)>) -> Vec<Vec<WorldPoint>> {
+    let mut lines = Vec::new();
+
+    while let Some((start, end)) = segments.pop() {
+        let mut line = vec![start, end];
+
+        loop {
+            let mut extended = false;
+            let head = *line.first().unwrap();
+            let tail = *line.last().unwrap();
+
+            let mut match_index = None;
+            let mut prepend = false;
+            let mut next_point = None;
+
+            for (index, (a, b)) in segments.iter().enumerate() {
+                if tail.distance(*a) <= CONTOUR_EPSILON {
+                    match_index = Some(index);
+                    next_point = Some(*b);
+                    break;
+                }
+                if tail.distance(*b) <= CONTOUR_EPSILON {
+                    match_index = Some(index);
+                    next_point = Some(*a);
+                    break;
+                }
+                if head.distance(*b) <= CONTOUR_EPSILON {
+                    match_index = Some(index);
+                    prepend = true;
+                    next_point = Some(*a);
+                    break;
+                }
+                if head.distance(*a) <= CONTOUR_EPSILON {
+                    match_index = Some(index);
+                    prepend = true;
+                    next_point = Some(*b);
+                    break;
+                }
+            }
+
+            if let Some(index) = match_index {
+                let next = next_point.unwrap();
+                segments.remove(index);
+                if prepend {
+                    line.insert(0, next);
+                } else {
+                    line.push(next);
+                }
+                extended = true;
+            }
+
+            if !extended {
+                break;
+            }
+        }
+
+        if line.len() >= 2 {
+            lines.push(line);
+        }
+    }
+
+    lines
+}
+
+fn smooth_heights(input: Vec<f32>, width: usize, height: usize, radius: usize) -> Vec<f32> {
+    let mut buf = input.clone();
+    let mut tmp = vec![0.0f32; width * height];
+
+    for y in 0..height {
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(width - 1);
+            let count = (x1 - x0 + 1) as f32;
+            let sum: f32 = (x0..=x1).map(|xi| buf[y * width + xi]).sum();
+            tmp[y * width + x] = sum / count;
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(height - 1);
+            let count = (y1 - y0 + 1) as f32;
+            let sum: f32 = (y0..=y1).map(|yi| tmp[yi * width + x]).sum();
+            buf[y * width + x] = sum / count;
+        }
+    }
+
+    buf
+}
+
+fn compute_hillshade(heights: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let lx: f32 = -0.5;
+    let ly: f32 = 0.5;
+    let lz: f32 = 1.0;
+    let len = (lx * lx + ly * ly + lz * lz).sqrt();
+    let (lx, ly, lz) = (lx / len, ly / len, lz / len);
+
+    let mut shade = vec![1.0f32; width * height];
+    for y in 1..height.saturating_sub(1) {
+        for x in 1..width.saturating_sub(1) {
+            let h_l = heights[y * width + (x - 1)];
+            let h_r = heights[y * width + (x + 1)];
+            let h_u = heights[(y - 1) * width + x];
+            let h_d = heights[(y + 1) * width + x];
+            let nx = h_l - h_r;
+            let ny = h_d - h_u;
+            let nz = 6.0_f32;
+            let nlen = (nx * nx + ny * ny + nz * nz).sqrt();
+            let dot = ((nx / nlen) * lx + (ny / nlen) * ly + (nz / nlen) * lz).max(0.0);
+            shade[y * width + x] = 0.45 + 0.55 * dot;
+        }
+    }
+
+    shade
 }
 
 fn terrain_color(height: f32, sea_level: f32) -> crate::model::RgbaColor {
@@ -239,11 +483,12 @@ fn terrain_color(height: f32, sea_level: f32) -> crate::model::RgbaColor {
 
 fn forest_overlay_color(density: f32) -> crate::model::RgbaColor {
     let forest = &theme().forest;
-    if density <= f32::EPSILON {
+    if density < 0.08 {
         return crate::model::RgbaColor::rgba(0, 0, 0, 0);
     }
 
-    let alpha = (density * forest.opacity).round().clamp(0.0, 255.0) as u8;
+    let coverage = ((density - 0.08) / 0.92).clamp(0.0, 1.0);
+    let alpha = (coverage.powf(0.5) * forest.opacity).round().clamp(0.0, 255.0) as u8;
     let color = forest.color.to_color();
     crate::model::RgbaColor::rgba(color.r, color.g, color.b, alpha)
 }

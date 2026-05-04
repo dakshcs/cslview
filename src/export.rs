@@ -36,6 +36,7 @@ impl LayerSetting {
 pub struct LayerSettings {
     pub terrain: LayerSetting,
     pub forests: LayerSetting,
+    pub contours: LayerSetting,
     pub districts: LayerSetting,
     pub parks: LayerSetting,
     pub roads: LayerSetting,
@@ -64,6 +65,42 @@ pub struct TransitLayers {
     pub metro: LayerSetting,
     pub pedestrian: LayerSetting,
     pub other: LayerSetting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MapMode {
+    Colour = 0,
+    Planning = 1,
+    Contour = 2,
+}
+
+impl MapMode {
+    pub const fn index(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_index(index: u8) -> Self {
+        match index {
+            1 => Self::Planning,
+            2 => Self::Contour,
+            _ => Self::Colour,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Colour => "Colour",
+            Self::Planning => "Planning",
+            Self::Contour => "Contour",
+        }
+    }
+}
+
+impl Default for MapMode {
+    fn default() -> Self {
+        Self::Colour
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +132,7 @@ pub struct ExportSettings {
     pub padding: f32,
     pub zoom: f32,
     pub frame: Option<WorldBounds>,
+    pub mode: MapMode,
     pub layers: LayerSettings,
     pub roads: RoadLayers,
     pub transit: TransitLayers,
@@ -109,6 +147,7 @@ impl Default for ExportSettings {
             padding: 120.0,
             zoom: 1.0,
             frame: None,
+            mode: MapMode::default(),
             layers: LayerSettings::default(),
             roads: RoadLayers::default(),
             transit: TransitLayers::default(),
@@ -158,6 +197,7 @@ impl Default for LayerSettings {
         Self {
             terrain: LayerSetting::new(true, 0.95),
             forests: LayerSetting::new(true, 0.62),
+            contours: LayerSetting::new(false, 0.72),
             districts: LayerSetting::new(true, 0.68),
             parks: LayerSetting::new(true, 0.72),
             roads: LayerSetting::new(true, 0.95),

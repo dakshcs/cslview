@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
-use cslview::export::{export_to_file, ExportKind, ExportSettings, LayerSettings, RoadLayers, TransitLayers};
+use cslview::export::{export_to_file, ExportKind, ExportSettings, LayerSettings, MapMode, RoadLayers, TransitLayers};
 use cslview::parser::parse_csl_file;
 use cslview::scene::build_scene;
 
@@ -67,6 +67,7 @@ fn main() -> Result<()> {
             padding: cli.padding,
             zoom: cli.zoom,
             frame: parse_frame(cli.frame.as_deref()),
+            mode: MapMode::default(),
             layers: LayerSettings::default(),
             roads: RoadLayers::default(),
             transit: TransitLayers::default(),

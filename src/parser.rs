@@ -354,7 +354,7 @@ fn handle_start(state: &mut ParseState, event: &BytesStart<'_>) {
                 }
             }
         }
-        "Sg" if path_contains(state, "Seg") => {
+        "P" => {
             state.current_route_link = Some(RouteLinkDraft {
                 start_node: state.current_segment.as_ref().map(|segment| segment.start_node).unwrap_or(0),
                 end_node: state.current_segment.as_ref().map(|segment| segment.end_node).unwrap_or(0),
